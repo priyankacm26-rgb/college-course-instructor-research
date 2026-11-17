@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Excel and temporary output
+*.xlsx
+*.backup
+output/
+
+# Debug and temporary files
+debug_*.py
+inspect_*.py
+test_*.py
+*.html
+*.png
+*.jpg
+*.jpeg
+*.log
+uncw_debug_output/
+uncw_multi_course_finder/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Old application backups
+app_backup*.py
+app_before*.py
+app_with_research_persistence.py
+
+# Debug and temporary research captures
+debug_*.py
+inspect_*.py
+test_*.py
+kirkwood_*.txt
+uncw_*.json
+portal_diagnostics.py
+
