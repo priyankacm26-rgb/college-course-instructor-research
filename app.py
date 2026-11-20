@@ -1,6 +1,10 @@
 import streamlit as st
 import pandas as pd
 import json
+import os
+import re
+import subprocess
+import sys
 from urllib.parse import urlparse
 from src.auth import login_user, get_current_user, logout_user
 from src.database import (
@@ -42,9 +46,33 @@ st.markdown(
     [data-testid="stTextInput"] input::placeholder, [data-testid="stNumberInput"] input::placeholder, [data-testid="stTextArea"] textarea::placeholder { color: #98A2B3 !important; -webkit-text-fill-color: #98A2B3 !important; opacity: 1; }
     [data-testid="stSelectbox"] [data-baseweb="select"] *, [data-testid="stMultiSelect"] [data-baseweb="select"] * { color: #172033 !important; }
     [data-testid="stTextInput"] input:focus, [data-testid="stNumberInput"] input:focus, [data-testid="stTextArea"] textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 2px rgba(36,87,197,.12); }
-    [data-testid="stButton"] button, [data-testid="stDownloadButton"] button { border-radius: 9px; min-height: 42px; font-weight: 650; border: 1px solid #D0D8E5; }
-    [data-testid="stButton"] button[kind="primary"], [data-testid="stDownloadButton"] button[kind="primary"] { background: var(--brand); border-color: var(--brand); color: #FFFFFF; }
-    [data-testid="stButton"] button[kind="primary"]:hover { background: var(--brand-dark); border-color: var(--brand-dark); }
+    /* Consistent blue theme: high-contrast blue buttons with white labels. */
+    [data-testid="stButton"] button, [data-testid="stDownloadButton"] button {
+        border-radius: 9px !important;
+        min-height: 42px;
+        font-weight: 650 !important;
+        background: #2457C5 !important;
+        border: 1px solid #2457C5 !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+    }
+    [data-testid="stButton"] button:hover, [data-testid="stDownloadButton"] button:hover {
+        background: #183F98 !important;
+        border-color: #183F98 !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+    }
+    [data-testid="stButton"] button p, [data-testid="stDownloadButton"] button p,
+    [data-testid="stButton"] button span, [data-testid="stDownloadButton"] button span {
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+    }
+    [data-testid="stButton"] button:disabled, [data-testid="stDownloadButton"] button:disabled {
+        background: #A9BFEF !important;
+        border-color: #A9BFEF !important;
+        color: #FFFFFF !important;
+        opacity: .8;
+    }
     [data-testid="stAlert"] { border-radius: 10px; border: 1px solid var(--line); }
     [data-testid="stExpander"] { border: 1px solid var(--line); border-radius: 10px; background: #FFFFFF; }
     [data-testid="stDataFrame"], [data-testid="stDataEditor"] { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
@@ -262,6 +290,7 @@ tabs = st.tabs([
     "📑  Evidence & Export",
     "🕘  Research History",
     "⚙️  College Configuration",
+    "🧾  Salesforce Export",
 ])
 
 with tabs[0]:
@@ -462,7 +491,10 @@ with tabs[0]:
     with col2:
         srn = st.text_input("CRN / Section ID (Optional)", key="c_srn")
         course_code = st.text_input(
-            "Course Number", placeholder="350", key="c_code"
+            "Course Number (Optional)",
+            placeholder="Leave blank to search all courses in the subject where supported",
+            key="c_code",
+            help="Leave blank to retrieve all courses in the selected subject and term where the college portal supports it. Enter a number to narrow the search.",
         )
         subject = st.text_input(
             "Subject / Department",
@@ -484,10 +516,10 @@ with tabs[0]:
             "College / University": college,
             "Term": term,
             "Official Class Schedule URL": schedule_url,
-            "Course Number": course_code,
             "Subject / Department": subject,
         }
         missing = [field for field, value in required.items() if not value.strip()]
+
         if missing:
             st.error("Please complete: " + ", ".join(missing))
         else:
@@ -566,6 +598,47 @@ with tabs[0]:
         st.divider()
         st.subheader("Course Data Review")
         st.caption("Verify and edit values against the official source.")
+
+        # Instructor names from course results are actionable. Selecting a name
+        # pre-fills the Instructor tab and attempts official-source discovery.
+        course_instructors = []
+        for course_row in st.session_state.course_rows:
+            raw_names = course_row.get("Instructor") or course_row.get("Instructor Name") or ""
+            if isinstance(raw_names, str):
+                names = [part.strip() for part in raw_names.replace(";", ",").split(",") if part.strip()]
+                # Preserve common "Last, First" names as a single name when
+                # the source stores that format in one field.
+                if raw_names.count(",") == 1 and len(names) == 2 and len(names[0].split()) == 1 and len(names[1].split()) == 1:
+                    names = [raw_names.strip()]
+            elif isinstance(raw_names, (list, tuple)):
+                names = [str(part).strip() for part in raw_names if str(part).strip()]
+            else:
+                names = []
+            for name in names:
+                if name.casefold() not in {x.casefold() for x in course_instructors}:
+                    course_instructors.append(name)
+
+        if course_instructors:
+            st.markdown("**Instructor verification — click a name to research it**")
+            with st.container(key="instructor_name_buttons"):
+                instructor_cols = st.columns(min(3, len(course_instructors)))
+                for idx, name in enumerate(course_instructors):
+                    with instructor_cols[idx % len(instructor_cols)]:
+                        if st.button(name, key=f"course_instructor_pick_{idx}", use_container_width=True):
+                            st.session_state["i_college"] = st.session_state.get("c_college", "")
+                            st.session_state["i_name"] = name
+                            st.session_state["i_department"] = (
+                                st.session_state.course_rows[0].get("Course Subject / Department Name")
+                                or st.session_state.course_rows[0].get("Course Discipline")
+                                or st.session_state.get("c_subject", "")
+                            )
+                            st.session_state["i_faculty_url"] = ""
+                            st.session_state["i_department_url"] = ""
+                            st.session_state["i_division_url"] = ""
+                            st.session_state["i_primary"] = "Unknown"
+                            st.session_state["auto_instructor_request"] = True
+                            st.rerun()
+
         course_df = pd.DataFrame(st.session_state.course_rows)
         edited = st.data_editor(
             course_df, num_rows="dynamic", use_container_width=True,
@@ -574,6 +647,58 @@ with tabs[0]:
         st.session_state.course_rows = edited.to_dict("records")
         with st.expander("View Registration Search Results / Source Text"):
             st.text(st.session_state.course_context[:20000])
+
+    # Auto-run the same instructor research method used by the Instructor tab.
+    # UNCW, Chico State and Central Michigan retain their dedicated lookups;
+    # Kirkwood HUM uses its official public Arts & Humanities faculty page.
+    if st.session_state.pop("auto_instructor_request", False):
+        auto_college = st.session_state.get("i_college", "").strip()
+        auto_name = st.session_state.get("i_name", "").strip()
+        auto_department = st.session_state.get("i_department", "").strip()
+        if not auto_name or not auto_college:
+            st.error("The selected course row is missing the college or instructor name.")
+        else:
+            try:
+                with st.spinner(f"Researching {auto_name} at {auto_college}..."):
+                    auto_result = researcher.research_instructor(
+                        college=auto_college,
+                        name=auto_name,
+                        department=auto_department,
+                        faculty_url="",
+                        department_url="",
+                        division_url="",
+                        primary=st.session_state.get("i_primary", "Unknown"),
+                        schedule_url=st.session_state.get("c_schedule", ""),
+                    )
+                st.session_state.instructor_rows = [auto_result["instructor"]]
+                st.session_state.evidence_rows.extend(auto_result["evidence"])
+                st.session_state.instructor_context = auto_result.get("context", "")
+                has_match = any(
+                    "name found" in str(item.get("Evidence note", "")).casefold()
+                    or "exact instructor name matched" in str(item.get("Evidence note", "")).casefold()
+                    or "official peoplesearch" in str(item.get("Evidence note", "")).casefold()
+                    for item in auto_result.get("evidence", [])
+                )
+                if has_match:
+                    st.success(f"Official-source match found for {auto_name}. Review the evidence and extracted fields in the Instructor tab.")
+                st.dataframe(pd.DataFrame(st.session_state.instructor_rows), use_container_width=True, hide_index=True)
+                auto_college_id = next((
+                    row.get("id") for row in client_colleges
+                    if str(row.get("name", "")).strip().casefold() == auto_college.casefold()
+                ), None)
+                try:
+                    save_research_run(
+                        run_type="instructor", college_id=auto_college_id,
+                        college_name=auto_college, term_name=None,
+                        status="completed" if has_match else "needs_review",
+                        inputs={"college": auto_college, "instructor_name": auto_name, "department": auto_department, "source": "course_result_click"},
+                        records=[auto_result["instructor"]], evidence=auto_result["evidence"],
+                        context=auto_result.get("context", ""),
+                    )
+                except Exception as save_exc:
+                    st.warning(f"Instructor details were retrieved but could not be saved to research history: {save_exc}")
+            except Exception as auto_exc:
+                st.error(f"Instructor research failed for {auto_name}: {auto_exc}")
 
 with tabs[1]:
     st.subheader("Instructor verification")
@@ -596,7 +721,8 @@ with tabs[1]:
             "Official School / College Page URL (Optional)", key="i_division_url"
         )
     primary = st.selectbox(
-        "Is this instructor primary?", ["Unknown", "TRUE", "FALSE"]
+        "Is this instructor primary?", ["Unknown", "TRUE", "FALSE"],
+        key="i_primary",
     )
 
     if st.button(
@@ -1027,3 +1153,73 @@ with tabs[4]:
             "Existing portal and term records are read-only here; adding a new "
             "record does not overwrite them."
         )
+
+# =======================================================
+# SALESFORCE PRINTABLE VIEW -> PDF -> EXCEL
+# College-name search flow retained from the pre-integration version.
+# Existing course/instructor research code above is unchanged.
+# =======================================================
+with tabs[5]:
+    st.subheader("Salesforce account PDF-to-Excel automation")
+    st.markdown(
+        "Enter the college or university name. The automation opens Salesforce "
+        "in Edge, lets you complete login/MFA, searches for the account by name, "
+        "opens Printable View, saves a PDF, and converts it into Excel."
+    )
+
+    sf_college_name = st.text_input(
+        "Salesforce Account / College Name",
+        placeholder="Example: California State University, Chico",
+        key="salesforce_export_college_name",
+    )
+
+    st.info(
+        "Salesforce login and MFA are completed by you in the visible Edge window. "
+        "The automation reuses its persistent Edge profile and does not store "
+        "your password or MFA code."
+    )
+
+    sf_script_dir = os.path.dirname(os.path.abspath(__file__))
+    sf_pipeline_path = os.path.join(
+        sf_script_dir, "salesforce_universal_pipeline.py"
+    )
+
+    if st.button(
+        "Start Salesforce PDF-to-Excel",
+        type="primary",
+        use_container_width=True,
+        key="start_salesforce_pdf_excel",
+    ):
+        clean_college_name = sf_college_name.strip()
+        if not clean_college_name:
+            st.error("Enter a college or university name.")
+        elif not os.path.isfile(sf_pipeline_path):
+            st.error(
+                "salesforce_universal_pipeline.py is missing from the project root. "
+                "Copy the supplied pipeline script beside app.py."
+            )
+        else:
+            try:
+                creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                subprocess.Popen(
+                    [sys.executable, sf_pipeline_path, clean_college_name],
+                    cwd=sf_script_dir,
+                    creationflags=creation_flags,
+                )
+                st.success(
+                    "Salesforce automation started in a separate console. "
+                    "Complete login/MFA in Edge and follow the console prompts."
+                )
+                st.markdown(
+                    "1. Complete Salesforce login/MFA in Edge.\n"
+                    "2. The script searches Salesforce for the college name.\n"
+                    "3. If automatic selection is not confirmed, open the correct Account record manually and press ENTER in the console.\n"
+                    "4. The script opens Printable View and creates the PDF, JSON, and Excel files in the project's `output` folder."
+                )
+            except Exception as sf_error:
+                st.error(f"Could not start Salesforce export: {sf_error}")
+
+    st.caption(
+        "This tab does not change course research, instructor research, evidence, "
+        "research history, college configuration, or existing Supabase records."
+    )

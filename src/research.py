@@ -262,367 +262,286 @@ def _parse_generic_course_records(
 def _search_kirkwood_courses(
     schedule_url, term, subject, course_code, srn, instructor, timeout
 ):
-    subject_code = subject.strip().split()[0].upper()
-    course_number = str(course_code).strip()
+    """Search Kirkwood by subject and term, optionally narrowing to one course."""
+    subject_code = _clean(subject).split()[0].upper()
+    course_number = _clean(course_code)
+    if not subject_code:
+        raise ValueError("Enter a Kirkwood subject code, for example HUM or ACC.")
 
-    term_match = re.search(
-        r"(Fall|Spring|Summer)\s+(\d{4})",
-        term,
-        re.IGNORECASE
-    )
-
+    term_match = re.search(r"(Fall|Spring|Summer)\s+(\d{4})", term, re.IGNORECASE)
     if not term_match:
         raise ValueError(
             "Kirkwood term must look like Fall 2026, Spring 2027 or Summer 2027."
         )
 
-    season = term_match.group(1).lower()
-    year = term_match.group(2)
-
-    term_suffix = {
-        "fall": "FA",
-        "spring": "SP",
-        "summer": "SU",
-    }[season]
-
+    season, year = term_match.group(1).lower(), term_match.group(2)
+    term_suffix = {"fall": "FA", "spring": "SP", "summer": "SU"}[season]
     term_code = f"{year}{term_suffix}"
     checkbox_id = f"STATICterm{year}{term_suffix}"
-    course_label = f"{subject_code}-{course_number}"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-
         try:
-            page.goto(
-                schedule_url,
-                wait_until="domcontentloaded",
-                timeout=timeout * 1000
-            )
-
-            search_box = page.get_by_placeholder(
-                "Search for courses..."
-            )
-
-            search_box.fill(
-                f"{subject_code} {course_number}"
-            )
+            page.goto(schedule_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            search_box = page.get_by_placeholder("Search for courses...")
+            search_box.fill(f"{subject_code} {course_number}".strip())
             search_box.press("Enter")
-
             page.wait_for_timeout(3000)
 
             checkbox = page.locator(f"#{checkbox_id}")
             label = page.locator(f'label[for="{checkbox_id}"]')
-
             if checkbox.count() == 0:
-                raise RuntimeError(
-                    f"Kirkwood term filter not found: {term}"
-                )
-
+                raise RuntimeError(f"Kirkwood term filter not found: {term}")
             if not checkbox.is_checked():
                 label.click()
-
             page.wait_for_timeout(2000)
 
-            section_button = page.get_by_role(
-                "button",
-                name=f"View Available Sections for {course_label}"
+            # Each course has its own sections request. With a blank course
+            # number, click every matching subject course; with a number, only
+            # click the matching course. Do not change other college adapters.
+            buttons = page.locator(
+                f'button[id^="collapsible-view-available-sections-for-{subject_code}-"]'
             )
-
-            if section_button.count() == 0:
-                raise RuntimeError(
-                    f"No section button found for {course_label} in {term}."
+            button_ids = buttons.evaluate_all("els => els.map(el => el.id)")
+            selected_buttons = []
+            for button_id in button_ids:
+                match = re.search(
+                    rf"-available-sections-for-{re.escape(subject_code)}-([A-Za-z0-9]+)-groupHeading$",
+                    button_id,
+                    re.IGNORECASE,
                 )
+                if not match:
+                    continue
+                found_number = match.group(1)
+                if course_number and found_number.casefold() != course_number.casefold():
+                    continue
+                selected_buttons.append((button_id, found_number))
 
-            with page.expect_response(
-                lambda response: (
-                    "/Student/Courses/Sections" in response.url
-                    and response.status == 200
-                ),
-                timeout=timeout * 1000
-            ) as response_info:
-                section_button.first.click()
+            if not selected_buttons:
+                target = f"{subject_code}-{course_number}" if course_number else subject_code
+                raise RuntimeError(f"No Kirkwood course results found for {target} in {term}.")
 
-            response = response_info.value
-            payload = response.json()
-
-            retrieved = payload.get("SectionsRetrieved", {})
-            term_groups = retrieved.get("TermsAndSections", [])
-
-            selected_group = next(
-                (
-                    group for group in term_groups
-                    if group.get("Term", {}).get("Code") == term_code
-                ),
-                None
-            )
-
-            if not selected_group:
-                raise RuntimeError(
-                    f"No API data returned for {term_code}."
+            rows, context_lines, evidence_urls = [], [], []
+            for button_id, found_number in selected_buttons:
+                button = page.locator(f'#{button_id}')
+                with page.expect_response(
+                    lambda response: (
+                        "/Student/Courses/Sections" in response.url
+                        and response.status == 200
+                    ),
+                    timeout=timeout * 1000,
+                ) as response_info:
+                    button.click()
+                response = response_info.value
+                evidence_urls.append(response.url)
+                payload = response.json()
+                retrieved = payload.get("SectionsRetrieved", {})
+                term_groups = retrieved.get("TermsAndSections", [])
+                selected_group = next(
+                    (group for group in term_groups
+                     if group.get("Term", {}).get("Code") == term_code),
+                    None,
                 )
-
-            course_info = retrieved.get("Course", {})
-            sections = selected_group.get("Sections", [])
-
-            rows = []
-            context_lines = [
-                f"COLLEGE: Kirkwood Community College",
-                f"TERM: {term}",
-                f"COURSE: {course_label}",
-                f"TITLE: {course_info.get('Title', '')}",
-                f"DESCRIPTION: {course_info.get('Description', '')}",
-                ""
-            ]
-
-            for item in sections:
-                section = item.get("Section", {})
-                section_name = section.get("SectionNameDisplay", "")
-
-                if srn and str(srn).strip() not in (
-                    section_name,
-                    str(section.get("Synonym", ""))
-                ):
+                if not selected_group:
                     continue
 
-                faculty = item.get("FacultyDisplay", "")
+                course_info = retrieved.get("Course", {})
+                sections = selected_group.get("Sections", [])
+                course_label = f"{subject_code}-{found_number}"
+                context_lines.extend([
+                    "COLLEGE: Kirkwood Community College", f"TERM: {term}",
+                    f"COURSE: {course_label}",
+                    f"TITLE: {course_info.get('Title', '')}",
+                    f"DESCRIPTION: {course_info.get('Description', '')}", "",
+                ])
 
-                if instructor and (
-                    instructor.casefold() not in faculty.casefold()
-                ):
-                    continue
+                for item in sections:
+                    section = item.get("Section", {})
+                    section_name = section.get("SectionNameDisplay", "")
+                    if srn and str(srn).strip() not in (
+                        section_name, str(section.get("Synonym", ""))
+                    ):
+                        continue
+                    faculty = item.get("FacultyDisplay", "")
+                    if instructor and instructor.casefold() not in faculty.casefold():
+                        continue
 
-                meetings = section.get("FormattedMeetingTimes", [])
+                    meetings, locations, online_flags = [], [], []
+                    for meeting in section.get("FormattedMeetingTimes", []):
+                        day = meeting.get("DaysOfWeekDisplay", "")
+                        start_time = meeting.get("StartTimeDisplay", "")
+                        end_time = meeting.get("EndTimeDisplay", "")
+                        dates = meeting.get("DatesDisplay", "")
+                        time_text = " ".join(
+                            part for part in (day, start_time, "-", end_time, dates) if part
+                        )
+                        if time_text:
+                            meetings.append(time_text)
+                        building = meeting.get("BuildingDisplay", "")
+                        room = meeting.get("RoomDisplay", "")
+                        location = " ".join(part for part in (building, room) if part)
+                        if location and location not in locations:
+                            locations.append(location)
+                        online_flags.append(meeting.get("IsOnline", False))
 
-                meeting_text = []
-                locations = []
-                online_flags = []
+                    if online_flags and all(online_flags):
+                        modality = "Online"
+                    elif any(online_flags):
+                        modality = "Hybrid"
+                    else:
+                        modality = "In-Person"
+                    location_display = section.get("LocationDisplay", "")
+                    if location_display and location_display not in locations:
+                        locations.insert(0, location_display)
 
-                for meeting in meetings:
-                    day = meeting.get("DaysOfWeekDisplay", "")
-                    start = meeting.get("StartTimeDisplay", "")
-                    end = meeting.get("EndTimeDisplay", "")
-                    dates = meeting.get("DatesDisplay", "")
-
-                    time_text = " ".join(
-                        part for part in (day, start, "-", end, dates)
-                        if part
-                    )
-                    if time_text:
-                        meeting_text.append(time_text)
-
-                    building = meeting.get("BuildingDisplay", "")
-                    room = meeting.get("RoomDisplay", "")
-
-                    location = " ".join(
-                        part for part in (building, room) if part
-                    )
-                    if location and location not in locations:
-                        locations.append(location)
-
-                    online_flags.append(
-                        meeting.get("IsOnline", False)
-                    )
-
-                if online_flags and all(online_flags):
-                    modality = "Online"
-                elif any(online_flags):
-                    modality = "Hybrid"
-                else:
-                    modality = "In-Person"
-
-                location_display = section.get("LocationDisplay", "")
-                if location_display and location_display not in locations:
-                    locations.insert(0, location_display)
-
-                row = _blank_row(COURSE_COLUMNS)
-
-                row["Course Subject / Department Name"] = subject
-                row["Course Discipline"] = subject_code
-                row["Course Catalog Code"] = course_number
-                row["Section ID"] = section_name
-                row["Course ID"] = section.get("Synonym", "")
-                row["Course Name"] = section.get("Title", "")
-                row["Course Description"] = course_info.get(
-                    "Description", ""
-                )
-                row["Credit Hours"] = section.get("MinimumCredits", "")
-                row["Course Date Start"] = section.get(
-                    "StartDateDisplay", ""
-                )
-                row["Course Date End"] = section.get(
-                    "EndDateDisplay", ""
-                )
-                row["Course Meeting Times"] = "; ".join(meeting_text)
-                row["Course Meeting Location"] = "; ".join(locations)
-                row["Course Enrollment Capacity"] = section.get(
-                    "Capacity", ""
-                )
-                row["Course Actual Enrollment"] = section.get(
-                    "Enrolled", ""
-                )
-                row["Course Waitlist Enrollment"] = section.get(
-                    "Waitlisted", ""
-                )
-                row["Course Modality"] = modality
-                row["Course Type"] = ", ".join(
-                    sorted({
+                    row = _blank_row(COURSE_COLUMNS)
+                    row["Course Subject / Department Name"] = subject
+                    row["Course Discipline"] = subject_code
+                    row["Course Catalog Code"] = found_number
+                    row["Section ID"] = section_name
+                    row["Course ID"] = section.get("Synonym", "")
+                    row["Course Name"] = section.get("Title", "")
+                    row["Course Description"] = course_info.get("Description", "")
+                    row["Credit Hours"] = section.get("MinimumCredits", "")
+                    row["Course Date Start"] = section.get("StartDateDisplay", "")
+                    row["Course Date End"] = section.get("EndDateDisplay", "")
+                    row["Course Meeting Times"] = "; ".join(meetings)
+                    row["Course Meeting Location"] = "; ".join(locations)
+                    row["Course Enrollment Capacity"] = section.get("Capacity", "")
+                    row["Course Actual Enrollment"] = section.get("Enrolled", "")
+                    row["Course Waitlist Enrollment"] = section.get("Waitlisted", "")
+                    row["Course Modality"] = modality
+                    row["Course Type"] = ", ".join(sorted({
                         detail.get("InstructorMethod", "")
                         for detail in item.get("InstructorDetails", [])
                         if detail.get("InstructorMethod")
-                    })
-                )
+                    }))
+                    row["Instructor"] = faculty
+                    rows.append(row)
+                    context_lines.extend([
+                        f"SECTION: {section_name}", f"INSTRUCTOR: {faculty}",
+                        f"LOCATION: {row['Course Meeting Location']}",
+                        f"MEETING TIMES: {row['Course Meeting Times']}",
+                        f"AVAILABILITY: {section.get('AvailabilityDisplay', '')}", "",
+                    ])
 
-                # Additional result field for Streamlit review.
-                row["Instructor"] = faculty
-
-                rows.append(row)
-
-                context_lines.extend([
-                    f"SECTION: {section_name}",
-                    f"INSTRUCTOR: {faculty}",
-                    f"LOCATION: {row['Course Meeting Location']}",
-                    f"MEETING TIMES: {row['Course Meeting Times']}",
-                    f"AVAILABILITY: {section.get('AvailabilityDisplay', '')}",
-                    ""
-                ])
-
+            rows = _dedupe_courses(rows)
             if not rows:
                 raise RuntimeError(
-                    "No matching sections found. Check the course, term, "
-                    "CRN/section ID and instructor filters."
+                    "Kirkwood returned course buttons but no matching sections. "
+                    "Check the term, CRN/section ID and instructor filters."
                 )
-
             return {
                 "course": rows,
                 "context": "\n".join(context_lines),
-                "url": response.url,
-                "status": response.status,
+                "url": evidence_urls[0],
+                "status": 200,
                 "title": page.title(),
             }
-
         finally:
             browser.close()
 
 
 def _search_uncw_instructor(name, department="", timeout=30):
-    from urllib.parse import urljoin
-
+    """Search UNCW's official ASP.NET People Search using its real form controls."""
     directory_url = "https://itsappserv01.uncw.edu/directory/"
 
-    parts = name.strip().split(maxsplit=1)
-    if len(parts) != 2:
-        raise ValueError(
-            "Enter the instructor's first and last name."
-        )
-
-    first_name, last_name = parts
+    requested = _clean(name)
+    if "," in requested:
+        last_name, first_part = [part.strip() for part in requested.split(",", 1)]
+        first_name = first_part.split()[0] if first_part else ""
+    else:
+        name_parts = requested.split()
+        if len(name_parts) < 2:
+            return {
+                "matches": [], "url": directory_url,
+                "title": "Directory: UNCW", "status": ""
+            }
+        first_name, last_name = name_parts[0], name_parts[-1]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-
         try:
             response = page.goto(
                 directory_url,
                 wait_until="domcontentloaded",
-                timeout=timeout * 1000
+                timeout=timeout * 1000,
             )
 
-            page.get_by_text(
-                "Staff/Faculty", exact=True
-            ).click()
-
-            page.get_by_label("First Name").fill(first_name)
-            page.get_by_label("Last Name").fill(last_name)
+            # These IDs and names are taken from the supplied UNCW page source.
+            # It is an ASP.NET WebForms form; Search is an input[type=submit].
+            page.locator("#rdoSearchTable_1").check(timeout=timeout * 1000)
+            page.locator("#txtFirstName").fill(first_name)
+            page.locator("#txtLastName").fill(last_name)
 
             if department:
-                department_select = page.locator("select").first
-                options = department_select.locator("option").all_text_contents()
+                department_select = page.locator("#lstDepartments")
+                options = department_select.locator("option").all()
+                wanted = _clean(department).casefold()
+                for option in options:
+                    label = _clean(option.inner_text())
+                    value = option.get_attribute("value") or ""
+                    if label.casefold() == wanted or value.replace("&#32;", " ").casefold() == wanted:
+                        department_select.select_option(value=value)
+                        break
 
-                matching = next(
-                    (
-                        option.strip()
-                        for option in options
-                        if option.strip().casefold() == department.strip().casefold()
-                    ),
-                    None
-                )
+            # The source confirms this is a POST submit control, not a button.
+            with page.expect_navigation(
+                wait_until="domcontentloaded",
+                timeout=timeout * 1000,
+            ):
+                page.locator("#btnSearch").click()
 
-                if matching:
-                    department_select.select_option(label=matching)
-
-            page.get_by_role(
-                "button", name="Search", exact=True
-            ).click()
-
-            table = page.locator("table").first
-            table.wait_for(state="visible", timeout=timeout * 1000)
-
-            page.wait_for_function(
-                """() => {
-                    const table = document.querySelector("table");
-                    return table &&
-                        table.querySelectorAll("tr").length > 1;
-                }""",
-                timeout=timeout * 1000
-            )
+            table = page.locator("#gvDirectory")
+            table.wait_for(state="attached", timeout=timeout * 1000)
 
             headers = [
-                x.strip().casefold()
-                for x in table.locator("tr").first.locator("th").all_text_contents()
+                _clean(value).casefold()
+                for value in table.locator("tr").first.locator("th").all_text_contents()
             ]
-
-            rows = table.locator("tr")
             matches = []
+            rows = table.locator("tr")
 
+            def normalized_person(value):
+                return re.sub(r"[^a-z]", "", _clean(value).casefold())
+
+            requested_full = normalized_person(f"{first_name} {last_name}")
             for i in range(1, rows.count()):
                 cells = rows.nth(i).locator("td")
-                values = [
-                    x.strip()
-                    for x in cells.all_text_contents()
-                ]
-
+                values = [_clean(value) for value in cells.all_text_contents()]
                 if not values:
                     continue
-
                 record = dict(zip(headers, values))
-
-                if record.get("name", "").casefold() != name.casefold():
+                found_name = record.get("name", "")
+                if normalized_person(found_name) != requested_full:
                     continue
 
                 email = ""
-                email_link = cells.nth(headers.index("email")).locator(
-                    'a[href^="mailto:"]'
-                )
-
-                if email_link.count():
-                    email = (
-                        email_link.first.get_attribute("href") or ""
-                    ).replace("mailto:", "").split("?")[0].strip()
+                if "email" in headers:
+                    email_cell = cells.nth(headers.index("email"))
+                    email_link = email_cell.locator('a[href^="mailto:"]')
+                    if email_link.count():
+                        email = (
+                            email_link.first.get_attribute("href") or ""
+                        ).replace("mailto:", "").split("?")[0].strip()
 
                 matches.append({
-                    "name": record.get("name", ""),
+                    "name": found_name,
                     "title": record.get("title", ""),
                     "department": record.get("department", ""),
                     "phone": record.get("phone", ""),
                     "email": email,
-                    "campus_box": record.get("campus box", "")
+                    "campus_box": record.get("campus box", ""),
                 })
-
-            if not matches:
-                raise RuntimeError(
-                    f"No Staff/Faculty match found for {name} "
-                    "in the UNCW People Search directory."
-                )
 
             return {
                 "matches": matches,
                 "url": page.url,
                 "title": page.title(),
-                "status": response.status if response else ""
+                "status": response.status if response else "",
             }
-
         finally:
             browser.close()
 
@@ -632,8 +551,8 @@ def _search_cmich_courses(schedule_url, term, subject, course_code, srn, instruc
     base_url = schedule_url or "https://courseregistration.apps.cmich.edu/"
     subject_code = str(subject or "").strip().split()[0].upper()
     number = str(course_code or "").strip()
-    if not subject_code or not number:
-        raise ValueError("CMU course search requires both a department code and course number.")
+    if not subject_code:
+        raise ValueError("CMU course search requires a department/subject code.")
     if not re.fullmatch(r"[A-Z0-9]+", subject_code):
         raise ValueError(f"Invalid CMU department code: {subject_code!r}")
 
@@ -656,7 +575,7 @@ def _search_cmich_courses(schedule_url, term, subject, course_code, srn, instruc
                 raise RuntimeError(f"CMU term '{term}' was not found. Available terms: {available}")
 
             page.locator("#AcademicSession").select_option(selected_term["value"])
-            page.locator("#Keyword").fill(f"{subject_code} {number}")
+            page.locator("#Keyword").fill(f"{subject_code} {number}".strip())
 
             # Department selection is optional; the course keyword is sufficient
             # and avoids depending on CMU's custom Angular multi-select internals.
@@ -685,7 +604,9 @@ def _search_cmich_courses(schedule_url, term, subject, course_code, srn, instruc
                 course_match = re.search(r"([A-Z]{2,6})\s+(\w+)\s*-\s*(.*?)\s*\[CR\s*([\d.]+)", heading, re.I)
                 if course_match:
                     found_subject, found_number, title, credits = course_match.groups()
-                    if found_subject.upper() != subject_code or found_number.upper() != number.upper():
+                    if found_subject.upper() != subject_code:
+                        continue
+                    if number and found_number.upper() != number.upper():
                         continue
                 else:
                     title, credits = heading, ""
@@ -718,7 +639,7 @@ def _search_cmich_courses(schedule_url, term, subject, course_code, srn, instruc
                     row = _blank_row(COURSE_COLUMNS)
                     row["Course Subject / Department Name"] = subject
                     row["Course Discipline"] = subject_code
-                    row["Course Catalog Code"] = number
+                    row["Course Catalog Code"] = found_number if course_match else number
                     row["Course Name"] = title
                     row["Credit Hours"] = credits
                     row["Course ID"] = section_id
@@ -741,7 +662,7 @@ def _search_cmich_courses(schedule_url, term, subject, course_code, srn, instruc
             if not rows:
                 visible = _clean(page.locator("body").inner_text())
                 raise RuntimeError(
-                    f"CMU search completed but no matching sections were extracted for {subject_code} {number} ({term}). "
+                    f"CMU search completed but no matching sections were extracted for {subject_code} {number or '(all courses)'} ({term}). "
                     f"Check the course number, term and filters. Page message: {visible[-500:]}"
                 )
 
@@ -929,8 +850,8 @@ def _search_chico_courses(schedule_url, term, subject, course_code, srn, instruc
 
     subject_code = _clean(subject).split()[0].upper()
     number = _clean(course_code)
-    if not subject_code or not number:
-        raise ValueError("Chico State course search requires a subject code and course number.")
+    if not subject_code:
+        raise ValueError("Chico State course search requires a subject code.")
     if not re.fullmatch(r"[A-Z0-9]+", subject_code):
         raise ValueError(f"Invalid Chico State subject code: {subject_code!r}")
 
@@ -1087,13 +1008,13 @@ def _search_chico_courses(schedule_url, term, subject, course_code, srn, instruc
     if not rows:
         raise RuntimeError(
             f"Chico State schedule API returned no matching sections for "
-            f"{subject_code} {number} ({term}). Check the term, course number, "
+            f"{subject_code} {number or '(all courses)'} ({term}). Check the term, course number, "
             "section/CRN and instructor filters."
         )
 
     context_parts = [
         "COLLEGE: California State University, Chico", f"TERM: {term} ({term_code})",
-        f"SUBJECT: {subject_code}", f"COURSE: {number}",
+        f"SUBJECT: {subject_code}", f"COURSE: {number or 'ALL COURSES'}",
     ]
     for item in context_records:
         context_parts.extend([
@@ -1218,14 +1139,81 @@ def _search_chico_instructor(name, department="", timeout=30):
             )
 
             def label_value(labels):
-                for label in labels:
-                    found = re.search(
-                        rf"(?:^|\n)\s*{label}\s*:?\s*([^\n]+)",
-                        body_text,
-                        re.I,
+                """Read profile label/value pairs without swallowing adjacent lines.
+
+                Chico's profile uses a two-column HTML table. A regex using \\s*
+                can cross the newline between the label and value and backtrack
+                into the value (for example, returning only the final 's' from
+                'Computer Science Department'). Prefer the actual DOM structure.
+                """
+                wanted = {
+                    re.sub(r"[^a-z0-9]+", " ", str(label).casefold()).strip()
+                    for label in labels
+                }
+
+                # First: explicit table rows (the layout used by Chico profiles).
+                try:
+                    rows_data = page.locator("tr").evaluate_all(
+                        """rows => rows.map(row =>
+                            Array.from(row.querySelectorAll("th, td"))
+                                .map(cell => (cell.innerText || cell.textContent || "")
+                                    .replace(/\\s+/g, " ").trim())
+                                .filter(Boolean)
+                        )"""
                     )
-                    if found:
-                        return _clean(found.group(1))
+                    for cells in rows_data:
+                        if len(cells) < 2:
+                            continue
+                        key = re.sub(r"[^a-z0-9]+", " ", cells[0].casefold()).strip().rstrip(":")
+                        if key in wanted:
+                            value = _clean(" ".join(cells[1:]))
+                            if value:
+                                return value
+                except Exception:
+                    pass
+
+                # Second: definition-list layouts used by some directory templates.
+                try:
+                    pairs = page.locator("dt").evaluate_all(
+                        """nodes => nodes.map(dt => ({
+                            label: (dt.innerText || dt.textContent || "").trim(),
+                            value: dt.nextElementSibling
+                                ? (dt.nextElementSibling.innerText || dt.nextElementSibling.textContent || "").trim()
+                                : ""
+                        }))"""
+                    )
+                    for pair in pairs:
+                        key = re.sub(
+                            r"[^a-z0-9]+", " ", pair.get("label", "").casefold()
+                        ).strip().rstrip(":")
+                        if key in wanted and _clean(pair.get("value")):
+                            return _clean(pair["value"])
+                except Exception:
+                    pass
+
+                # Third: line-oriented text fallback. Do not use \\s* here:
+                # it matches newlines and can consume the value itself.
+                body_lines = [_clean(line) for line in body_text.splitlines() if _clean(line)]
+                for index, line in enumerate(body_lines):
+                    normalized = re.sub(r"[^a-z0-9]+", " ", line.casefold()).strip()
+                    if normalized.rstrip(":") in wanted:
+                        if index + 1 < len(body_lines):
+                            return body_lines[index + 1]
+                    for label in labels:
+                        match = re.match(
+                            rf"^{re.escape(label)}[ \\t]*:[ \\t]*(.+)$",
+                            line,
+                            re.I,
+                        )
+                        if match and _clean(match.group(1)):
+                            return _clean(match.group(1))
+                        match = re.match(
+                            rf"^{re.escape(label)}[ \\t]+(.+)$",
+                            line,
+                            re.I,
+                        )
+                        if match and _clean(match.group(1)):
+                            return _clean(match.group(1))
                 return ""
 
             title = label_value(["Title", "Position", "Job Title", "Academic Rank"])
@@ -1248,6 +1236,137 @@ def _search_chico_instructor(name, department="", timeout=30):
         finally:
             browser.close()
 
+
+
+def _parse_uncw_json_records(
+    records, subject_code="", course_code="", crn_filter="", instructor_filter=""
+):
+    """Map structured UNCW Banner section JSON into the existing course schema."""
+    import html
+
+    rows = []
+    day_names = (
+        ("sunday", "Sun"), ("monday", "Mon"), ("tuesday", "Tue"),
+        ("wednesday", "Wed"), ("thursday", "Thu"),
+        ("friday", "Fri"), ("saturday", "Sat"),
+    )
+
+    def clock(value):
+        value = _clean(value)
+        if not value:
+            return ""
+        digits = re.sub(r"[^0-9]", "", value).zfill(4)[-4:]
+        try:
+            hour, minute = int(digits[:2]), int(digits[2:])
+            suffix = "AM" if hour < 12 else "PM"
+            hour12 = hour % 12 or 12
+            return f"{hour12}:{minute:02d} {suffix}"
+        except Exception:
+            return value
+
+    for item in records or []:
+        if not isinstance(item, dict):
+            continue
+        number = _clean(item.get("courseNumber") or item.get("courseDisplay"))
+        code = _clean(item.get("subject") or subject_code)
+        crn = _clean(item.get("courseReferenceNumber"))
+        if course_code and number.casefold() != str(course_code).strip().casefold():
+            continue
+        if subject_code and code.casefold() != str(subject_code).strip().casefold():
+            continue
+        if crn_filter and crn.casefold() != str(crn_filter).strip().casefold():
+            continue
+
+        faculty = item.get("faculty") or []
+        names = [_clean(person.get("displayName")) for person in faculty
+                 if isinstance(person, dict) and _clean(person.get("displayName"))]
+        emails = [_clean(person.get("emailAddress")) for person in faculty
+                  if isinstance(person, dict) and _clean(person.get("emailAddress"))]
+        if instructor_filter:
+            instructor_text = " ".join(names).casefold()
+            requested_name = instructor_filter.casefold().replace(",", " ")
+            name_tokens = [token for token in requested_name.split() if token]
+            if not all(token in instructor_text for token in name_tokens):
+                continue
+
+        meeting_text = []
+        locations = []
+        start_dates = []
+        end_dates = []
+        for meeting in item.get("meetingsFaculty") or []:
+            if not isinstance(meeting, dict):
+                continue
+            mt = meeting.get("meetingTime") or {}
+            if not isinstance(mt, dict):
+                continue
+            days = [label for key, label in day_names if mt.get(key) is True]
+            start_time, end_time = clock(mt.get("beginTime")), clock(mt.get("endTime"))
+            time_part = " - ".join(x for x in (start_time, end_time) if x)
+            line = " ".join(x for x in (", ".join(days), time_part) if x)
+            if line:
+                meeting_text.append(line)
+            building = _clean(mt.get("buildingDescription") or mt.get("building"))
+            room = _clean(mt.get("room"))
+            location = " ".join(x for x in (building, room) if x)
+            if location and location not in locations:
+                locations.append(location)
+            start_date, end_date = _clean(mt.get("startDate")), _clean(mt.get("endDate"))
+            if start_date and start_date not in start_dates:
+                start_dates.append(start_date)
+            if end_date and end_date not in end_dates:
+                end_dates.append(end_date)
+
+        campus = _clean(item.get("campusDescription"))
+        instructional = _clean(item.get("instructionalMethodDescription") or item.get("scheduleTypeDescription"))
+        location_text = "; ".join(locations)
+        online = ("online" in instructional.casefold() or "online" in location_text.casefold()
+                  or "web" in instructional.casefold())
+
+        row = _blank_row(COURSE_COLUMNS)
+        row["Course Subject / Department Name"] = _clean(item.get("subjectDescription") or code)
+        row["Course Discipline"] = code
+        row["Campus"] = campus
+        row["Course Catalog Code"] = number
+        row["Section ID"] = _clean(item.get("sequenceNumber"))
+        row["Course ID"] = crn
+        row["Course Name"] = _clean(item.get("courseTitle"))
+        row["Course Type"] = _clean(item.get("scheduleTypeDescription"))
+        row["Course Modality"] = "Online" if online else ("In-Person" if location_text else instructional)
+        row["Course Enrollment Capacity"] = _clean(item.get("maximumEnrollment"))
+        row["Course Actual Enrollment"] = _clean(item.get("enrollment"))
+        row["Course Waitlist Capacity"] = _clean(item.get("waitCapacity"))
+        row["Course Waitlist Enrollment"] = _clean(item.get("waitCount"))
+        row["Course Meeting Location"] = location_text or ("Online" if online else "")
+        row["Credit Hours"] = _clean(item.get("creditHourLow") or item.get("creditHours"))
+        row["Course Date Start"] = "; ".join(start_dates)
+        row["Course Date End"] = "; ".join(end_dates)
+        row["Course Meeting Times"] = "; ".join(dict.fromkeys(meeting_text))
+
+        attributes = []
+        for attr in item.get("sectionAttributes") or []:
+            if isinstance(attr, dict):
+                code_value = html.unescape(_clean(attr.get("code")))
+                desc_value = html.unescape(_clean(attr.get("description")))
+                value = " - ".join(x for x in (code_value, desc_value) if x)
+                if value:
+                    attributes.append(value)
+        details = []
+        if item.get("termDesc"):
+            details.append(f"Term: {_clean(item.get('termDesc'))}")
+        if item.get("instructionalMethodDescription"):
+            details.append(f"Instructional method: {_clean(item.get('instructionalMethodDescription'))}")
+        if attributes:
+            details.append("Section attributes: " + "; ".join(attributes))
+        if details:
+            row["Course Description"] = "\n".join(details)
+
+        # Optional QA fields are intentionally added per row; the shared schema
+        # is not modified, so other college exports remain unaffected.
+        row["Instructor"] = "; ".join(names)
+        row["Instructor Email"] = "; ".join(emails)
+        rows.append(row)
+
+    return _dedupe_courses(rows)
 
 class Researcher:
     def __init__(self, timeout=30, use_browser=False):
@@ -1370,7 +1489,7 @@ class Researcher:
 
         # Existing UNCW and generic portal workflow remains unchanged.
         result = search_banner_classes(
-            schedule_url, term, subject, course_code, self.timeout, college=college
+            schedule_url, term, subject, course_code, self.timeout
         )
 
         text = result.get("text", "") or ""
@@ -1435,7 +1554,6 @@ class Researcher:
                     else ("In-Person" if row["Course Meeting Location"] else "")
                 )
                 optional_fields = {
-                    "Course Description": item.get("description", ""),
                     "Credit Hours": item.get("credits", ""),
                     "Course Enrollment Capacity": item.get("capacity", ""),
                     "Course Actual Enrollment": item.get("enrollment", ""),
@@ -1446,6 +1564,33 @@ class Researcher:
                 for column, value in optional_fields.items():
                     if column in row:
                         row[column] = value
+
+                # The shared workbook schema has one description field rather
+                # than separate columns for PeopleSoft detail-page metadata.
+                # Preserve all Glendale-only detail fields there instead of
+                # changing the global schema or affecting other colleges.
+                description_parts = []
+                if item.get("description"):
+                    description_parts.append(f"Description: {item['description']}")
+                for label, key in (
+                    ("Add Consent", "add_consent"),
+                    ("Enrollment Requirements", "enrollment_requirements"),
+                    ("Class Attributes", "class_attributes"),
+                    ("Enrollment Information", "enrollment_information"),
+                    ("Class Availability", "class_availability"),
+                    ("Combined Section", "combined_section_information"),
+                    ("Notes", "class_notes"),
+                    ("Textbook/Other Materials", "textbook_materials"),
+                ):
+                    value = _clean(item.get(key, ""))
+                    if value:
+                        description_parts.append(f"{label}: {value}")
+                full_detail_text = _clean(item.get("detail_text", ""))
+                if full_detail_text:
+                    description_parts.append(f"Full Class Detail Page: {full_detail_text}")
+                if "Course Description" in row:
+                    row["Course Description"] = "\n".join(description_parts)
+
                 if "Course Meeting Dates" in row:
                     row["Course Meeting Dates"] = item.get("meeting_dates", "")
                 if "Course Status" in row:
@@ -1457,13 +1602,23 @@ class Researcher:
             result.get("platform") == "uncw_banner"
             or "registration.uncw.edu" in result.get("url", "")
         ):
-            course_rows = _parse_uncw_course_records(
-                text,
+            # Prefer the structured Banner response; retain the old rendered
+            # table parser as a fallback for portal/UI variations.
+            course_rows = _parse_uncw_json_records(
+                result.get("records", []),
                 subject_code=subject,
                 course_code=course_code,
                 crn_filter=srn,
                 instructor_filter=instructor,
             )
+            if not course_rows:
+                course_rows = _parse_uncw_course_records(
+                    text,
+                    subject_code=subject,
+                    course_code=course_code,
+                    crn_filter=srn,
+                    instructor_filter=instructor,
+                )
 
             if not course_rows and tables:
                 course_rows = _parse_uncw_course_records(
@@ -1502,6 +1657,27 @@ class Researcher:
             f"SEARCH RESULTS:\n{text}\n\n"
             f"TABLES:\n" + "\n\n".join(tables)
         )
+        if result.get("platform") == "glendale_peoplesoft":
+            detail_blocks = []
+            for item in result.get("records", []):
+                detail_blocks.append(
+                    "\n".join([
+                        f"CLASS NUMBER: {item.get('class_number', '')}",
+                        f"SECTION: {item.get('section', '')}",
+                        f"INSTRUCTOR: {item.get('instructor', '')}",
+                        f"ADD CONSENT: {item.get('add_consent', '')}",
+                        f"ENROLLMENT REQUIREMENTS: {item.get('enrollment_requirements', '')}",
+                        f"CLASS ATTRIBUTES: {item.get('class_attributes', '')}",
+                        f"ENROLLMENT INFORMATION: {item.get('enrollment_information', '')}",
+                        f"CLASS AVAILABILITY: {item.get('class_availability', '')}",
+                        f"COMBINED SECTION: {item.get('combined_section_information', '')}",
+                        f"NOTES: {item.get('class_notes', '')}",
+                        f"DESCRIPTION: {item.get('description', '')}",
+                        f"TEXTBOOK/OTHER MATERIALS: {item.get('textbook_materials', '')}",
+                        f"DETAIL PAGE TEXT: {item.get('detail_text', '')}",
+                    ])
+                )
+            context += "\n\nGLENDALE CLASS DETAIL PAGES:\n" + "\n\n".join(detail_blocks)
 
         evidence = [
             _evidence(
@@ -1524,7 +1700,7 @@ class Researcher:
     
     def research_instructor(
         self, college, name, department, faculty_url,
-        department_url, division_url, primary
+        department_url, division_url, primary, schedule_url=""
     ):
         
         
@@ -1627,55 +1803,117 @@ class Researcher:
                 timeout=self.timeout
             )
 
-            match = result["matches"][0]
-
             row = _blank_row(INSTRUCTOR_COLUMNS)
             row["Instructor #01 Is Primary"] = (
                 "" if primary == "Unknown" else primary
             )
-            row["Instructor #01 Title"] = match["title"]
-            row["Instructor #01 Department"] = match["department"]
-            row["Instructor #01 Phone"] = match["phone"]
-            row["Instructor #01 Email"] = match["email"]
 
-            context = (
-                f"COLLEGE: {college}\n"
-                f"INSTRUCTOR: {match['name']}\n"
-                f"TITLE: {match['title']}\n"
-                f"DEPARTMENT: {match['department']}\n"
-                f"PHONE: {match['phone']}\n"
-                f"EMAIL: {match['email']}\n"
-                f"CAMPUS BOX: {match['campus_box']}\n"
-            )
+            if result["matches"]:
+                match = result["matches"][0]
+                row["Instructor #01 Title"] = match["title"]
+                row["Instructor #01 Department"] = match["department"]
+                row["Instructor #01 Phone"] = match["phone"]
+                row["Instructor #01 Email"] = match["email"]
+                context = (
+                    f"COLLEGE: {college}\n"
+                    f"INSTRUCTOR: {match['name']}\n"
+                    f"TITLE: {match['title']}\n"
+                    f"DEPARTMENT: {match['department']}\n"
+                    f"PHONE: {match['phone']}\n"
+                    f"EMAIL: {match['email']}\n"
+                    f"CAMPUS BOX: {match['campus_box']}\n"
+                )
+                evidence_note = (
+                    "Official UNCW People Search; Staff/Faculty filter used. "
+                    "Exact first-name and last-name match found."
+                )
+            else:
+                # No directory match: keep all researched instructor fields blank.
+                context = (
+                    f"COLLEGE: {college}\n"
+                    f"INSTRUCTOR SEARCH: {name}\n"
+                    "RESULT: No exact Staff/Faculty match found.\n"
+                )
+                evidence_note = (
+                    "Official UNCW People Search was queried by first and last name; "
+                    "no exact match was returned. Instructor detail fields left blank."
+                )
 
             evidence = [{
                 "Source URL": result["url"],
                 "Source title": result["title"],
                 "HTTP status": result["status"],
                 "Fields supported / review": (
-                    "Instructor name, title, department, phone, "
-                    "email and campus box."
+                    "Name, title, department, phone, email and campus box "
+                    "when an exact directory match is returned."
                 ),
-                "Evidence note": (
-                    "Official UNCW People Search; Staff/Faculty filter "
-                    "used. Exact instructor name matched."
-                )
+                "Evidence note": evidence_note,
             }]
 
             return {
                 "instructor": row,
                 "evidence": evidence,
-                "context": context
+                "context": context,
             }
 
         import re
 
-        urls = [
-            faculty_url,
-            department_url,
-            division_url,
-        ]
+        # Kirkwood's general faculty directory is login-restricted. For HUM
+        # courses, use the official public Arts & Humanities staff/faculty page.
+        # The generic extractor below still requires the requested name to be
+        # present on that official page before extracting any personal fields.
+        if (
+            "kirkwood" in (college or "").casefold()
+            and not (faculty_url or "").strip()
+            and (department or "").strip().upper().startswith("HUM")
+        ):
+            faculty_url = (
+                "https://www.kirkwood.edu/about-us/faculty-leadership/"
+                "academic-departments/arts-and-humanities/index"
+            )
 
+        urls = [faculty_url, department_url, division_url]
+
+        # If the user arrived here by clicking a course instructor, discover
+        # likely directory links from the supplied official schedule page.
+        # Stay on the same host and only consider links whose labels/URLs
+        # indicate faculty, staff, people, directory, or department pages.
+        if schedule_url and not any(str(url or "").strip() for url in urls):
+            try:
+                from urllib.parse import urljoin, urlparse
+                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+                parsed_schedule = urlparse(schedule_url)
+                schedule_host = (parsed_schedule.hostname or "").casefold()
+                discovered = []
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    try:
+                        page.goto(schedule_url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
+                        links = page.locator("a[href]").evaluate_all(
+                            "els => els.map(a => ({href:a.href, text:(a.innerText || a.textContent || '').trim(), aria:a.getAttribute('aria-label') || ''}))"
+                        )
+                        keywords = ("faculty", "staff", "directory", "people", "instructor", "department", "our team")
+                        for link in links:
+                            target = str(link.get("href", ""))
+                            label = " ".join((link.get("text", ""), link.get("aria", ""), target)).casefold()
+                            target_host = (urlparse(target).hostname or "").casefold()
+                            if target.startswith("http") and target_host == schedule_host and any(k in label for k in keywords):
+                                if target not in discovered:
+                                    discovered.append(target)
+                            if len(discovered) >= 12:
+                                break
+                    finally:
+                        browser.close()
+                urls.extend(discovered)
+                if not discovered:
+                    urls.append(schedule_url)
+            except Exception:
+                # Directory discovery is best-effort; explicit URLs and
+                # dedicated college adapters remain unaffected.
+                pass
+
+        urls = list(dict.fromkeys(str(url).strip() for url in urls if str(url or "").strip()))
         pages = []
         evidence = []
         context_parts = [

@@ -44,3 +44,5 @@ kirkwood_*.txt
 uncw_*.json
 portal_diagnostics.py
 
+
+salesforce_edge_profile/
