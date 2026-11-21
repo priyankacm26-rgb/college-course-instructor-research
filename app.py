@@ -5,14 +5,12 @@ import os
 import re
 import subprocess
 import sys
+from uuid import uuid4
 from urllib.parse import urlparse
-from src.auth import login_user, get_current_user, logout_user
-from src.database import (
-    get_user_workspaces,
-    get_client_colleges,
-    get_client_portals,
-    get_client_portals_for_college,
-    get_client_terms,
+from src.mysql_store import (
+    load_local_config, save_local_config, get_client_colleges,
+    get_client_portals, get_client_portals_for_college, get_client_terms,
+    search_college_master,
 )
 
 from src.research import Researcher
@@ -89,113 +87,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ================= AUTHENTICATION GATE =================
+# ================= LOCAL, PASSWORD-FREE WORKSPACE =================
+local_config = load_local_config()
+selected_client_id = "local"
+client_colleges = get_client_colleges(local_config, selected_client_id)
 
-st.session_state.setdefault("authenticated", False)
-
-if not st.session_state.get("authenticated"):
-    # Compact, centered login layout; the full dashboard keeps its wide layout.
-    st.markdown(
-        """
-        <style>
-        [data-testid="stMainBlockContainer"] {
-            max-width: 760px !important;
-            padding-top: 2.5rem !important;
-            padding-bottom: 2rem !important;
-        }
-        [data-testid="stForm"] {
-            max-width: 520px;
-            margin: 1rem auto 0 auto;
-            padding: 1.4rem 1.6rem 1.2rem 1.6rem;
-            background: #FFFFFF;
-            border: 1px solid #E5EAF2;
-            border-radius: 14px;
-            box-shadow: 0 8px 28px rgba(16,24,40,.06);
-        }
-        [data-testid="stForm"] [data-testid="stTextInput"] input {
-            min-height: 40px;
-        }
-        [data-testid="stForm"] [data-testid="stFormSubmitButton"] button {
-            min-height: 40px;
-            padding: 0 1.25rem;
-            border-radius: 8px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "<div class='app-hero'><div class='app-eyebrow'>College Research AI</div>"
-        "<p class='app-hero-title'>Welcome back</p>"
-        "<p class='app-hero-sub'>Sign in to research college schedules, courses and faculty evidence.</p></div>",
-        unsafe_allow_html=True,
-    )
-    st.subheader("Sign in to your workspace")
-
-    with st.form("login_form"):
-        email = st.text_input("Email address")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign In", type="primary")
-
-    if submitted:
-        try:
-            login_user(email, password)
-            st.success("Login successful!")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Login failed: {exc}")
-
-    st.stop()
-
-
-# Validate the existing session
-supabase, current_user = get_current_user()
-
-if not current_user:
-    st.warning("Your session has expired. Please sign in again.")
-    st.stop()
-
-# Load the workspaces assigned to this user
-workspaces = get_user_workspaces(
-    supabase,
-    current_user.id
-)
-
-if not workspaces:
-    st.error("No client workspace is assigned to this account.")
-    st.stop()
-
-# Workspace selection
-st.markdown("<div class='app-eyebrow'>Workspace</div>", unsafe_allow_html=True)
-def workspace_name(item):
-    relation = item.get("clients")
-    if isinstance(relation, dict):
-        return relation.get("name", "Unnamed Workspace")
-    if isinstance(relation, list) and relation:
-        return relation[0].get("name", "Unnamed Workspace")
-    return "Unnamed Workspace"
-
-
-workspace_options = {
-    item["client_id"]: workspace_name(item)
-    for item in workspaces
-}
-
-selected_client_id = st.selectbox(
-    "Select Client Workspace",
-    options=list(workspace_options.keys()),
-    format_func=lambda client_id: workspace_options[client_id],
-    key="active_client_id",
-)
-
-# Sidebar logout
 with st.sidebar:
-    st.write(f"Signed in: {current_user.email}")
-    if st.button("Logout", use_container_width=True):
-        logout_user()
-        st.rerun()
-
-# =======================================================
+    st.markdown("<div class='app-eyebrow'>Local workspace</div>", unsafe_allow_html=True)
+    st.caption("Password-free mode. College configuration is stored in MySQL.")
+    st.header("Research Settings")
+    timeout = st.number_input("Page timeout (seconds)", min_value=10, max_value=120, value=60)
+    use_browser = st.checkbox("Use Playwright for JavaScript pages", value=True)
+    st.info("Playwright is recommended for dynamic registration systems. Some college portals may require a dedicated adapter.")
+    st.divider()
+    st.subheader("College Configuration")
+    st.success(f"Loaded {len(client_colleges)} configured college(s) from MySQL.")
+    st.caption("Use the College Configuration tab to add colleges, schedule portals and terms.")
+    st.divider()
+    st.markdown("### Supported research")
+    st.write("• Course schedule research\\n• Instructor profile research\\n• Evidence collection\\n• Excel export")
 
 
 st.markdown(
@@ -205,44 +115,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.header("Research Settings")
-    timeout = st.number_input(
-        "Page timeout (seconds)", min_value=10, max_value=120, value=60
-    )
-    use_browser = st.checkbox(
-        "Use Playwright for JavaScript pages", value=True
-    )
-    st.info(
-        "Playwright is recommended for dynamic registration systems. "
-        "Some college portals may require a dedicated adapter."
-    )
-
-    st.divider()
-    st.subheader("Workspace College Configuration")
-
-    try:
-        client_colleges = get_client_colleges(supabase, selected_client_id)
-        st.success(f"Loaded {len(client_colleges)} college(s) from this workspace.")
-    except Exception as exc:
-        client_colleges = []
-        st.error(f"Could not load workspace colleges: {exc}")
-
-    st.divider()
-    st.markdown("### Supported research")
-    st.write(
-        "• Course schedule research\n"
-        "• Instructor profile research\n"
-        "• Evidence collection\n"
-        "• Excel export"
-    )
-
 session_defaults = {
     "course_rows": [],
     "instructor_rows": [],
     "evidence_rows": [],
     "course_context": "",
     "instructor_context": "",
+    "research_history": [],
 }
 for key, value in session_defaults.items():
     if key not in st.session_state:
@@ -252,45 +131,37 @@ researcher = Researcher(timeout=int(timeout), use_browser=use_browser)
 
 
 def save_research_run(
-    run_type,
-    college_id,
-    college_name,
-    term_name,
-    status,
-    inputs,
-    records=None,
-    evidence=None,
-    context="",
-    error="",
+    run_type, college_id, college_name, term_name, status, inputs,
+    records=None, evidence=None, context="", error="",
 ):
-    """Persist one completed or failed research attempt for this workspace."""
+    """Save a research attempt in this browser session."""
+    from datetime import datetime, timezone
+    from uuid import uuid4
     payload = {
-        "run_type": run_type,
-        "college_name": college_name,
-        "inputs": inputs or {},
-        "records": records or [],
-        "evidence": evidence or [],
-        "context": context or "",
+        "run_type": run_type, "college_name": college_name,
+        "inputs": inputs or {}, "records": records or [],
+        "evidence": evidence or [], "context": context or "",
         "error": error or "",
     }
-    response = supabase.table("research_runs").insert({
-        "client_id": selected_client_id,
-        "college_id": college_id,
-        "term_name": term_name or None,
-        "status": status,
+    row = {
+        "id": str(uuid4()), "college_id": college_id,
+        "term_name": term_name or None, "status": status,
         "results": payload,
-    }).execute()
-    return response.data[0] if response.data else None
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    st.session_state["research_history"].insert(0, row)
+    st.session_state["research_history"] = st.session_state["research_history"][:100]
+    return row
 
 
 active_course_college_id = None
 tabs = st.tabs([
-    "📚  Course Schedule",
-    "👩‍🏫  Instructor",
-    "📑  Evidence & Export",
-    "🕘  Research History",
-    "⚙️  College Configuration",
-    "🧾  Salesforce Export",
+    "Course Schedule",
+    "Instructor",
+    "Evidence & Export",
+    "Research History",
+    "College Configuration",
+    "Salesforce Export",
 ])
 
 with tabs[0]:
@@ -303,8 +174,8 @@ with tabs[0]:
         # Only show colleges that have both a schedule URL and at least one term.
         # Fetch workspace-wide configuration once instead of querying each college.
         try:
-            workspace_portals = get_client_portals(supabase, selected_client_id)
-            workspace_terms = get_client_terms(supabase, selected_client_id)
+            workspace_portals = get_client_portals(local_config, selected_client_id)
+            workspace_terms = get_client_terms(local_config, selected_client_id)
 
             colleges_with_schedule = {
                 row.get("college_id")
@@ -317,11 +188,19 @@ with tabs[0]:
                 if row.get("college_id") and (row.get("term_name") or "").strip()
             }
 
+            # Keep the Course Schedule workflow limited to the five pilot colleges.
+            # The full 7,722-college master list remains available in College Configuration.
+            pilot_college_names = {
+                "Kirkwood Community College",
+                "University of North Carolina Wilmington",
+                "Glendale Community College (California)",
+                "California State University, Chico",
+                "Central Michigan University",
+            }
             configured_college_ids = [
                 college_id
-                for college_id in college_by_id
-                if college_id in colleges_with_schedule
-                and college_id in colleges_with_terms
+                for college_id, row in college_by_id.items()
+                if str(row.get("name", "")).strip() in pilot_college_names
             ]
         except Exception as exc:
             configured_college_ids = []
@@ -340,12 +219,12 @@ with tabs[0]:
 
             try:
                 selected_portals = get_client_portals_for_college(
-                    supabase,
+                    local_config,
                     selected_client_id,
                     selected_college_id,
                 )
                 selected_terms = get_client_terms(
-                    supabase,
+                    local_config,
                     selected_client_id,
                     selected_college_id,
                 )
@@ -559,14 +438,14 @@ with tabs[0]:
                     )
                     if saved_run:
                         st.success(
-                            f"Course search completed and saved. Run ID: {saved_run.get('id', 'saved')}"
+                            f"Course search completed and saved to this session. Run ID: {saved_run.get('id', 'saved')}"
                         )
                     else:
                         st.success("Course search completed. Review the results below.")
-                        st.warning("Research results were not confirmed as saved in Supabase.")
+                        st.warning("Research results are available in current session history only.")
                 except Exception as save_exc:
                     st.success("Course search completed. Review the results below.")
-                    st.warning(f"Could not save this run to Supabase: {save_exc}")
+                    st.warning(f"Could not add this run to session history: {save_exc}")
             except Exception as exc:
                 try:
                     save_research_run(
@@ -696,7 +575,7 @@ with tabs[0]:
                         context=auto_result.get("context", ""),
                     )
                 except Exception as save_exc:
-                    st.warning(f"Instructor details were retrieved but could not be saved to research history: {save_exc}")
+                    st.warning(f"Instructor details were retrieved but could not be added to session history: {save_exc}")
             except Exception as auto_exc:
                 st.error(f"Instructor research failed for {auto_name}: {auto_exc}")
 
@@ -783,14 +662,14 @@ with tabs[1]:
                     )
                     if saved_run:
                         st.success(
-                            f"Instructor research completed and saved. Run ID: {saved_run.get('id', 'saved')}"
+                            f"Instructor research completed and saved to this session. Run ID: {saved_run.get('id', 'saved')}"
                         )
                     else:
                         st.success("Instructor research completed. Verify each field.")
-                        st.warning("Research results were not confirmed as saved in Supabase.")
+                        st.warning("Research results are available in current session history only.")
                 except Exception as save_exc:
                     st.success("Instructor research completed. Verify each field.")
-                    st.warning(f"Could not save this run to Supabase: {save_exc}")
+                    st.warning(f"Could not add this run to session history: {save_exc}")
             except Exception as exc:
                 instructor_college_id = next(
                     (
@@ -899,260 +778,294 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Research history")
-    st.markdown(
-        "<p class='section-note'>Completed and failed research attempts saved for this workspace.</p>",
-        unsafe_allow_html=True,
-    )
-    try:
-        history_response = (
-            supabase.table("research_runs")
-            .select("id, college_id, term_name, status, results, created_at")
-            .eq("client_id", selected_client_id)
-            .order("created_at", desc=True)
-            .limit(100)
-            .execute()
+    st.markdown("<p class='section-note'>Research attempts saved during this browser session. History is cleared when the session expires.</p>", unsafe_allow_html=True)
+    history_rows = st.session_state.get("research_history", [])
+    if history_rows:
+        summary_rows = []
+        for item in history_rows:
+            payload = item.get("results") or {}
+            summary_rows.append({
+                "Run ID": item.get("id"), "Type": payload.get("run_type", "unknown"),
+                "College": payload.get("college_name", ""), "Term": item.get("term_name") or "",
+                "Status": item.get("status", ""), "Created": item.get("created_at", ""),
+                "Records": len(payload.get("records") or []),
+            })
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+        run_options = {str(item.get("id")): item for item in history_rows}
+        selected_run_id = st.selectbox(
+            "View research run", options=list(run_options.keys()),
+            format_func=lambda rid: (
+                f"{run_options[rid].get('results', {}).get('run_type', 'run').title()} — "
+                f"{run_options[rid].get('results', {}).get('college_name', 'Unknown college')} — "
+                f"{run_options[rid].get('created_at', '')}"
+            ), key="research_history_selection",
         )
-        history_rows = history_response.data or []
-        if history_rows:
-            summary_rows = []
-            for item in history_rows:
-                result_payload = item.get("results") or {}
-                summary_rows.append({
-                    "Run ID": item.get("id"),
-                    "Type": result_payload.get("run_type", "unknown"),
-                    "College": result_payload.get("college_name", ""),
-                    "Term": item.get("term_name") or "",
-                    "Status": item.get("status", ""),
-                    "Created": item.get("created_at", ""),
-                    "Records": len(result_payload.get("records") or []),
-                })
-            st.dataframe(
-                pd.DataFrame(summary_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-            run_options = {
-                str(item.get("id")): item
-                for item in history_rows
-            }
-            selected_run_id = st.selectbox(
-                "View saved research run",
-                options=list(run_options.keys()),
-                format_func=lambda run_id: (
-                    f"{run_options[run_id].get('results', {}).get('run_type', 'run').title()} — "
-                    f"{run_options[run_id].get('results', {}).get('college_name', 'Unknown college')} — "
-                    f"{run_options[run_id].get('created_at', '')}"
-                ),
-                key="research_history_selection",
-            )
-            selected_run = run_options[selected_run_id]
-            with st.expander("Saved run details", expanded=True):
-                st.json(selected_run.get("results") or {})
-        else:
-            st.info(
-                "No research runs have been saved for this workspace yet. "
-                "Run a course or instructor search to create the first history record."
-            )
-    except Exception as history_exc:
-        st.error(f"Could not load research history: {history_exc}")
-        st.caption(
-            "Check that the research_runs table has SELECT permission for workspace members."
-        )
+        with st.expander("Research run details", expanded=True):
+            st.json(run_options[selected_run_id].get("results") or {})
+    else:
+        st.info("No research runs in this session yet. Run a course or instructor search to create the first history record.")
 
 
 with tabs[4]:
-    st.subheader("College portal & term configuration")
+    st.subheader("College Configuration")
     st.markdown(
-        "<p class='section-note'>Add official schedule portals and academic terms "
-        "for colleges in this workspace. Existing configurations are not changed.</p>",
+        "<p class='section-note'>Search the imported master college list, add a college to your workspace, "
+        "then configure its official schedule portal and academic terms.</p>",
         unsafe_allow_html=True,
     )
 
-    if not client_colleges:
-        st.warning("No colleges are available in this workspace.")
-    else:
-        config_college_by_id = {row["id"]: row for row in client_colleges}
-        config_college_ids = list(config_college_by_id.keys())
+    # Reload from MySQL so the configuration tab always reflects saved records.
+    try:
+        local_config = load_local_config()
+        client_colleges = get_client_colleges(local_config, selected_client_id)
+    except Exception as exc:
+        st.error(f"Could not load college configuration from MySQL: {exc}")
+        local_config = {"colleges": [], "college_portals": [], "terms": []}
+        client_colleges = []
 
-        config_college_id = st.selectbox(
-            "Choose a college to configure",
-            options=config_college_ids,
-            format_func=lambda college_id: config_college_by_id[college_id]["name"],
+    with st.expander("Find and add a college from the master list", expanded=not bool(client_colleges)):
+        st.caption("Search the 7,722 imported colleges. Master-list entries are not research-ready until you add a schedule portal and term.")
+        master_query = st.text_input(
+            "Search college master list",
+            placeholder="Type at least 2 characters, e.g. Kirkwood",
+            key="college_master_search",
+        )
+        if master_query.strip():
+            try:
+                master_matches = search_college_master(master_query.strip(), limit=50)
+            except Exception as exc:
+                master_matches = []
+                st.error(f"Could not search the MySQL college master list: {exc}")
+
+            if master_matches:
+                master_by_id = {str(row["id"]): row for row in master_matches}
+                chosen_master_id = st.selectbox(
+                    "Matching colleges",
+                    options=list(master_by_id.keys()),
+                    format_func=lambda item: (
+                        f'{master_by_id[item]["college_name"]} '
+                        f'— {master_by_id[item].get("control_type") or "Control type not listed"}'
+                    ),
+                    key="college_master_match",
+                )
+                chosen_master = master_by_id[chosen_master_id]
+                if st.button("Add selected college to configuration", type="primary", key="add_master_college"):
+                    already_added = any(
+                        str(row.get("name", "")).strip().casefold()
+                        == str(chosen_master["college_name"]).strip().casefold()
+                        for row in client_colleges
+                    )
+                    if already_added:
+                        st.warning("This college is already configured.")
+                    else:
+                        local_config.setdefault("colleges", []).append({
+                            "id": str(uuid4()),
+                            "client_id": selected_client_id,
+                            "name": chosen_master["college_name"],
+                            "website_url": "",
+                            "control_type": chosen_master.get("control_type") or "",
+                            "master_college_id": chosen_master["id"],
+                        })
+                        try:
+                            save_local_config(local_config)
+                            st.success(f'{chosen_master["college_name"]} added. Now add its official schedule URL and academic term.')
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not add college to MySQL: {exc}")
+            else:
+                st.info("No matching colleges found. Try another search term.")
+        else:
+            st.info("Enter at least two characters to search.")
+
+    st.divider()
+    with st.expander("Add a college manually", expanded=False):
+        with st.form("add_local_college_form", clear_on_submit=True):
+            new_college_name = st.text_input("College / University name")
+            new_college_url = st.text_input(
+                "Official college website (optional)",
+                placeholder="https://college.edu",
+            )
+            add_college = st.form_submit_button(
+                "Add college manually", type="primary", use_container_width=True
+            )
+        if add_college:
+            if not new_college_name.strip():
+                st.error("College name is required.")
+            elif any(
+                str(row.get("name", "")).strip().casefold()
+                == new_college_name.strip().casefold()
+                for row in client_colleges
+            ):
+                st.warning("This college is already configured.")
+            else:
+                local_config.setdefault("colleges", []).append({
+                    "id": str(uuid4()),
+                    "client_id": selected_client_id,
+                    "name": new_college_name.strip(),
+                    "website_url": new_college_url.strip(),
+                })
+                try:
+                    save_local_config(local_config)
+                    st.success("College added to MySQL.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save college: {exc}")
+
+    # Refresh after any successful add.
+    local_config = load_local_config()
+    client_colleges = get_client_colleges(local_config, selected_client_id)
+
+    if client_colleges:
+        college_map = {str(row["id"]): row for row in client_colleges}
+        college_id = st.selectbox(
+            "Choose a configured college",
+            list(college_map),
+            format_func=lambda cid: college_map[cid]["name"],
             key="config_college_choice",
         )
-        config_college = config_college_by_id[config_college_id]
+        selected_config_college = college_map[college_id]
+        portals = get_client_portals_for_college(local_config, selected_client_id, college_id)
+        terms = get_client_terms(local_config, selected_client_id, college_id)
 
-        try:
-            current_portals = get_client_portals_for_college(
-                supabase, selected_client_id, config_college_id
-            )
-            current_terms = get_client_terms(
-                supabase, selected_client_id, config_college_id
-            )
-        except Exception as exc:
-            current_portals = []
-            current_terms = []
-            st.error(f"Could not load current configuration: {exc}")
-
-        portal_col, term_col = st.columns(2)
-
-        with portal_col:
+        left, right = st.columns(2)
+        with left:
             st.markdown("#### Add official schedule portal")
-            with st.form("add_college_portal_form", clear_on_submit=False):
-                portal_name = st.text_input(
-                    "Portal name",
-                    value="Class Schedule",
-                    help="Example: Class Schedule, Banner Self-Service, Schedule Search",
-                )
-                schedule_url_input = st.text_input(
+            with st.form("add_college_portal_form", clear_on_submit=True):
+                pname = st.text_input("Portal name", value="Class Schedule")
+                purl = st.text_input(
                     "Official schedule URL",
                     placeholder="https://college.edu/class-schedule",
                 )
-                platform_input = st.text_input(
+                platform = st.text_input(
                     "Platform (optional)",
                     placeholder="Banner, Self-Service, PeopleSoft, etc.",
                 )
-                portal_submitted = st.form_submit_button(
+                add_portal = st.form_submit_button(
                     "Save schedule portal", type="primary", use_container_width=True
                 )
-
-            if portal_submitted:
-                parsed_url = urlparse(schedule_url_input.strip())
-                if not portal_name.strip():
+            if add_portal:
+                parsed = urlparse(purl.strip())
+                if not pname.strip():
                     st.error("Portal name is required.")
-                elif parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
-                    st.error("Enter a valid official URL beginning with https:// or http://.")
+                elif parsed.scheme not in ("http", "https") or not parsed.netloc:
+                    st.error("Enter a valid http:// or https:// URL.")
+                elif any(
+                    (row.get("schedule_url") or "").rstrip("/") == purl.strip().rstrip("/")
+                    for row in portals
+                ):
+                    st.warning("This schedule URL is already saved.")
                 else:
+                    local_config.setdefault("college_portals", []).append({
+                        "id": str(uuid4()),
+                        "client_id": selected_client_id,
+                        "college_id": college_id,
+                        "portal_name": pname.strip(),
+                        "schedule_url": purl.strip(),
+                        "platform": platform.strip() or None,
+                        "status": "active",
+                    })
                     try:
-                        existing = (
-                            supabase.table("college_portals")
-                            .select("id, portal_name, schedule_url")
-                            .eq("client_id", selected_client_id)
-                            .eq("college_id", config_college_id)
-                            .execute()
-                        )
-                        duplicate = any(
-                            (row.get("schedule_url") or "").strip().rstrip("/")
-                            == schedule_url_input.strip().rstrip("/")
-                            for row in (existing.data or [])
-                        )
-                        if duplicate:
-                            st.warning("This schedule URL is already saved for this college.")
-                        else:
-                            supabase.table("college_portals").insert({
-                                "client_id": selected_client_id,
-                                "college_id": config_college_id,
-                                "portal_name": portal_name.strip(),
-                                "schedule_url": schedule_url_input.strip(),
-                                "platform": platform_input.strip() or None,
-                                "status": "active",
-                                "metadata": {
-                                    "added_via": "college_configuration",
-                                    "review_status": "client_supplied",
-                                },
-                            }).execute()
-                            st.success("Schedule portal saved.")
-                            st.rerun()
+                        save_local_config(local_config)
+                        st.success("Schedule portal saved to MySQL.")
+                        st.rerun()
                     except Exception as exc:
                         st.error(f"Could not save schedule portal: {exc}")
 
-        with term_col:
+        with right:
             st.markdown("#### Add academic term")
-            with st.form("add_college_term_form", clear_on_submit=False):
-                term_name_input = st.text_input(
-                    "Term name",
-                    placeholder="Fall 2026",
-                )
-                term_code_input = st.text_input(
-                    "Term code (optional)",
-                    placeholder="2026FA",
-                )
-                term_submitted = st.form_submit_button(
+            with st.form("add_college_term_form", clear_on_submit=True):
+                tname = st.text_input("Term name", placeholder="Fall 2026")
+                tcode = st.text_input("Term code (optional)", placeholder="2026FA")
+                add_term = st.form_submit_button(
                     "Save academic term", type="primary", use_container_width=True
                 )
-
-            if term_submitted:
-                if not term_name_input.strip():
+            if add_term:
+                if not tname.strip():
                     st.error("Term name is required.")
+                elif any(
+                    (row.get("term_name") or "").casefold() == tname.strip().casefold()
+                    for row in terms
+                ):
+                    st.warning("This term is already saved.")
                 else:
+                    local_config.setdefault("terms", []).append({
+                        "id": str(uuid4()),
+                        "client_id": selected_client_id,
+                        "college_id": college_id,
+                        "term_name": tname.strip(),
+                        "term_code": tcode.strip() or None,
+                    })
                     try:
-                        existing = (
-                            supabase.table("terms")
-                            .select("id, term_name")
-                            .eq("client_id", selected_client_id)
-                            .eq("college_id", config_college_id)
-                            .execute()
-                        )
-                        duplicate = any(
-                            (row.get("term_name") or "").strip().casefold()
-                            == term_name_input.strip().casefold()
-                            for row in (existing.data or [])
-                        )
-                        if duplicate:
-                            st.warning("This academic term is already saved for this college.")
-                        else:
-                            supabase.table("terms").insert({
-                                "client_id": selected_client_id,
-                                "college_id": config_college_id,
-                                "term_name": term_name_input.strip(),
-                                "term_code": term_code_input.strip() or None,
-                                "metadata": {
-                                    "added_via": "college_configuration",
-                                    "review_status": "client_supplied",
-                                },
-                            }).execute()
-                            st.success("Academic term saved.")
-                            st.rerun()
+                        save_local_config(local_config)
+                        st.success("Academic term saved to MySQL.")
+                        st.rerun()
                     except Exception as exc:
                         st.error(f"Could not save academic term: {exc}")
 
         st.divider()
-        st.markdown(f"#### Existing configuration — {config_college['name']}")
-        existing_left, existing_right = st.columns(2)
-
-        with existing_left:
+        st.markdown(f"#### Existing configuration — {selected_config_college['name']}")
+        c1, c2 = st.columns(2)
+        with c1:
             st.markdown("**Saved schedule portals**")
-            if current_portals:
-                portal_display = [
-                    {
+            if portals:
+                st.dataframe(
+                    pd.DataFrame([{
                         "Portal": row.get("portal_name"),
                         "URL": row.get("schedule_url"),
                         "Platform": row.get("platform"),
                         "Status": row.get("status"),
-                    }
-                    for row in current_portals
-                ]
-                st.dataframe(
-                    pd.DataFrame(portal_display),
+                    } for row in portals]),
                     use_container_width=True,
                     hide_index=True,
                 )
             else:
                 st.info("No schedule portal saved yet.")
-
-        with existing_right:
+        with c2:
             st.markdown("**Saved academic terms**")
-            if current_terms:
-                term_display = [
-                    {
+            if terms:
+                st.dataframe(
+                    pd.DataFrame([{
                         "Term": row.get("term_name"),
                         "Term code": row.get("term_code"),
-                    }
-                    for row in current_terms
-                ]
-                st.dataframe(
-                    pd.DataFrame(term_display),
+                    } for row in terms]),
                     use_container_width=True,
                     hide_index=True,
                 )
             else:
                 st.info("No academic terms saved yet.")
+    else:
+        st.info("Search the master list above or add a college manually.")
 
-        st.caption(
-            "Only records for the selected college and workspace are displayed. "
-            "Existing portal and term records are read-only here; adding a new "
-            "record does not overwrite them."
-        )
+    st.divider()
+    st.markdown("#### Backup / restore MySQL configuration")
+    st.download_button(
+        "Download college configuration JSON",
+        data=json.dumps(local_config, indent=2),
+        file_name="college_config_backup.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    upload = st.file_uploader(
+        "Restore configuration from JSON backup",
+        type=["json"],
+        key="restore_local_config_json",
+    )
+    if upload is not None and st.button(
+        "Restore uploaded configuration", key="restore_local_config_button"
+    ):
+        try:
+            restored = json.load(upload)
+            if not isinstance(restored, dict) or any(
+                not isinstance(restored.get(key, []), list)
+                for key in ("colleges", "college_portals", "terms")
+            ):
+                raise ValueError("Invalid configuration JSON structure.")
+            save_local_config(restored)
+            st.success("Configuration restored to MySQL.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not restore configuration: {exc}")
+
 
 # =======================================================
 # SALESFORCE PRINTABLE VIEW -> PDF -> EXCEL
@@ -1191,7 +1104,14 @@ with tabs[5]:
         key="start_salesforce_pdf_excel",
     ):
         clean_college_name = sf_college_name.strip()
-        if not clean_college_name:
+
+        if os.name != "nt":
+            st.warning(
+                "Salesforce PDF-to-Excel automation is available only when "
+                "running the app locally on Windows with Edge installed. "
+                "The other research features remain available."
+            )
+        elif not clean_college_name:
             st.error("Enter a college or university name.")
         elif not os.path.isfile(sf_pipeline_path):
             st.error(
@@ -1221,5 +1141,5 @@ with tabs[5]:
 
     st.caption(
         "This tab does not change course research, instructor research, evidence, "
-        "research history, college configuration, or existing Supabase records."
+        "research history or local college configuration."
     )

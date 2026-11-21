@@ -1858,60 +1858,90 @@ class Researcher:
 
         import re
 
-        # Kirkwood's general faculty directory is login-restricted. For HUM
-        # courses, use the official public Arts & Humanities staff/faculty page.
-        # The generic extractor below still requires the requested name to be
-        # present on that official page before extracting any personal fields.
-        if (
-            "kirkwood" in (college or "").casefold()
-            and not (faculty_url or "").strip()
-            and (department or "").strip().upper().startswith("HUM")
-        ):
-            faculty_url = (
-                "https://www.kirkwood.edu/about-us/faculty-leadership/"
-                "academic-departments/arts-and-humanities/index"
+        is_kirkwood = "kirkwood" in (college or "").casefold()
+        is_glendale = "glendale community college" in (college or "").casefold()
+
+        # Public source roots for these two colleges. Glendale's online
+        # directory is separate from the PeopleSoft schedule host; Kirkwood's
+        # public academic-department pages are separate from Self-Service.
+        if is_glendale:
+            urls = [
+                faculty_url,
+                department_url,
+                division_url,
+                "https://www.glendale.edu/directory/index.html",
+                "https://www.glendale.edu/about-gcc/faculty-and-staff/index.html",
+                "https://www.glendale.edu/about-gcc/gcc-overview/inside-gcc/college-directory",
+            ]
+        else:
+            urls = [faculty_url, department_url, division_url]
+            if is_kirkwood:
+                urls.extend([
+                    "https://www.kirkwood.edu/about-us/faculty-leadership/",
+                    "https://www.kirkwood.edu/about-us/faculty-leadership/academic-departments/",
+                    "https://www.kirkwood.edu/",
+                ])
+                if (department or "").strip().upper().startswith("HUM"):
+                    urls.append(
+                        "https://www.kirkwood.edu/about-us/faculty-leadership/"
+                        "academic-departments/arts-and-humanities/index"
+                    )
+
+        # Discover linked official pages even when one directory URL was
+        # already supplied. The old condition skipped discovery whenever any
+        # URL existed, which prevented Kirkwood's other public source pages
+        # from being searched. Do not crawl unrelated external hosts.
+        discovery_roots = list(urls)
+        if schedule_url:
+            discovery_roots.append(schedule_url)
+        discovered = []
+        try:
+            from urllib.parse import urlparse
+            root_hosts = set()
+            for root in discovery_roots:
+                host = (urlparse(str(root or "")).hostname or "").casefold()
+                if host:
+                    root_hosts.add(host)
+                    if is_kirkwood and host.endswith("kirkwood.edu"):
+                        root_hosts.add("www.kirkwood.edu")
+                    if is_glendale and (host.endswith("glendale.edu") or host.endswith("glendale.cc.ca.us")):
+                        root_hosts.update(("www.glendale.edu", "glendale.edu"))
+            keywords = (
+                "faculty", "staff", "directory", "people", "instructor",
+                "department", "division", "academic", "program", "contact",
+                "profile", "our team", "employees", "faculty-leadership",
             )
-
-        urls = [faculty_url, department_url, division_url]
-
-        # If the user arrived here by clicking a course instructor, discover
-        # likely directory links from the supplied official schedule page.
-        # Stay on the same host and only consider links whose labels/URLs
-        # indicate faculty, staff, people, directory, or department pages.
-        if schedule_url and not any(str(url or "").strip() for url in urls):
-            try:
-                from urllib.parse import urljoin, urlparse
-                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-                parsed_schedule = urlparse(schedule_url)
-                schedule_host = (parsed_schedule.hostname or "").casefold()
-                discovered = []
-                with sync_playwright() as playwright:
-                    browser = playwright.chromium.launch(headless=True)
-                    page = browser.new_page()
-                    try:
-                        page.goto(schedule_url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
-                        links = page.locator("a[href]").evaluate_all(
-                            "els => els.map(a => ({href:a.href, text:(a.innerText || a.textContent || '').trim(), aria:a.getAttribute('aria-label') || ''}))"
-                        )
-                        keywords = ("faculty", "staff", "directory", "people", "instructor", "department", "our team")
-                        for link in links:
-                            target = str(link.get("href", ""))
-                            label = " ".join((link.get("text", ""), link.get("aria", ""), target)).casefold()
-                            target_host = (urlparse(target).hostname or "").casefold()
-                            if target.startswith("http") and target_host == schedule_host and any(k in label for k in keywords):
-                                if target not in discovered:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page()
+                try:
+                    for root in discovery_roots[:8]:
+                        if not root:
+                            continue
+                        try:
+                            page.goto(root, wait_until="domcontentloaded", timeout=self.timeout * 1000)
+                            links = page.locator("a[href]").evaluate_all(
+                                "els => els.map(a => ({href:a.href, text:(a.innerText || a.textContent || '').trim(), aria:a.getAttribute('aria-label') || ''}))"
+                            )
+                            for link in links:
+                                target = str(link.get("href", "")).split("#", 1)[0]
+                                target_host = (urlparse(target).hostname or "").casefold()
+                                label = " ".join((link.get("text", ""), link.get("aria", ""), target)).casefold()
+                                if (target.startswith("http") and target_host in root_hosts
+                                        and any(word in label for word in keywords)
+                                        and target not in discovered):
                                     discovered.append(target)
-                            if len(discovered) >= 12:
-                                break
-                    finally:
-                        browser.close()
-                urls.extend(discovered)
-                if not discovered:
-                    urls.append(schedule_url)
-            except Exception:
-                # Directory discovery is best-effort; explicit URLs and
-                # dedicated college adapters remain unaffected.
-                pass
+                                if len(discovered) >= 30:
+                                    break
+                        except Exception:
+                            continue
+                        if len(discovered) >= 30:
+                            break
+                finally:
+                    browser.close()
+        except Exception:
+            pass
+        urls.extend(discovered)
 
         urls = list(dict.fromkeys(str(url).strip() for url in urls if str(url or "").strip()))
         pages = []
@@ -2036,17 +2066,30 @@ class Researcher:
 
                 # Only extract fields from text surrounding
                 # the requested instructor's exact name.
-                matching_lines = [
-                    i for i, line in enumerate(lines)
-                    if name.casefold() in line.casefold()
-                ]
+                def normalized_person(value):
+                    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+                requested_name = _clean(name)
+                name_parts = [part for part in re.split(r"[\s,]+", requested_name) if part]
+                requested_norm = normalized_person(requested_name)
+                reversed_norm = normalized_person(" ".join(reversed(name_parts[:2]))) if len(name_parts) >= 2 else ""
+                matching_lines = []
+                for i, line in enumerate(lines):
+                    line_norm = normalized_person(line)
+                    if (requested_norm and requested_norm in line_norm) or (
+                        reversed_norm and reversed_norm in line_norm
+                    ) or (
+                        len(name_parts) >= 2
+                        and all(normalized_person(part) in line_norm for part in name_parts[:2])
+                    ):
+                        matching_lines.append(i)
 
                 if matching_lines:
                     relevant_lines = set()
 
                     for index in matching_lines:
-                        start = max(0, index - 5)
-                        end = min(len(lines), index + 8)
+                        start = max(0, index - 8)
+                        end = min(len(lines), index + 16)
 
                         relevant_lines.update(
                             range(start, end)
@@ -2056,9 +2099,24 @@ class Researcher:
                         lines[i] for i in sorted(relevant_lines)
                     )
 
-                    extracted = extract_from_context(
-                        relevant_text
-                    )
+                    extracted = extract_from_context(relevant_text)
+
+                    # Glendale directory entries commonly render as
+                    # "Last, First | email | extension | location | division".
+                    # Capture these structured values without requiring labels.
+                    if is_glendale:
+                        email_match = re.search(
+                            r"\b[A-Z0-9._%+-]+@glendale\.edu\b",
+                            relevant_text, re.IGNORECASE
+                        )
+                        if email_match and not extracted.get("Instructor #01 Email"):
+                            extracted["Instructor #01 Email"] = email_match.group(0)
+                        phone_match = re.search(
+                            r"(?:ext\.?\s*)?(\d{3,5})\b",
+                            relevant_text, re.IGNORECASE
+                        )
+                        if phone_match and not extracted.get("Instructor #01 Phone"):
+                            extracted["Instructor #01 Phone"] = phone_match.group(0)
 
                     for key, value in extracted.items():
                         if not row.get(key) and value:
