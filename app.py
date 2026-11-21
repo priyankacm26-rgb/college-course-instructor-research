@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import json
 import os
@@ -13,12 +13,15 @@ from src.mysql_store import (
     search_college_master,
 )
 
+from src.browser_setup import ensure_chromium
+ensure_chromium()
+
 from src.research import Researcher
 from src.exporter import build_workbook
 
 st.set_page_config(
     page_title="College Research Agent",
-    page_icon="🎓",
+    page_icon="ðŸŽ“",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -105,7 +108,7 @@ with st.sidebar:
     st.caption("Use the College Configuration tab to add colleges, schedule portals and terms.")
     st.divider()
     st.markdown("### Supported research")
-    st.write("• Course schedule research\\n• Instructor profile research\\n• Evidence collection\\n• Excel export")
+    st.write("â€¢ Course schedule research\\nâ€¢ Instructor profile research\\nâ€¢ Evidence collection\\nâ€¢ Excel export")
 
 
 st.markdown(
@@ -260,7 +263,7 @@ with tabs[0]:
 
             portal_labels = {
                 index: (
-                    f'{portal.get("portal_name") or "Portal"} — '
+                    f'{portal.get("portal_name") or "Portal"} â€” '
                     f'{portal.get("schedule_url")}'
                 )
                 for index, portal in enumerate(schedule_candidates)
@@ -498,7 +501,7 @@ with tabs[0]:
                     course_instructors.append(name)
 
         if course_instructors:
-            st.markdown("**Instructor verification — click a name to research it**")
+            st.markdown("**Instructor verification â€” click a name to research it**")
             with st.container(key="instructor_name_buttons"):
                 instructor_cols = st.columns(min(3, len(course_instructors)))
                 for idx, name in enumerate(course_instructors):
@@ -795,8 +798,8 @@ with tabs[3]:
         selected_run_id = st.selectbox(
             "View research run", options=list(run_options.keys()),
             format_func=lambda rid: (
-                f"{run_options[rid].get('results', {}).get('run_type', 'run').title()} — "
-                f"{run_options[rid].get('results', {}).get('college_name', 'Unknown college')} — "
+                f"{run_options[rid].get('results', {}).get('run_type', 'run').title()} â€” "
+                f"{run_options[rid].get('results', {}).get('college_name', 'Unknown college')} â€” "
                 f"{run_options[rid].get('created_at', '')}"
             ), key="research_history_selection",
         )
@@ -844,7 +847,7 @@ with tabs[4]:
                     options=list(master_by_id.keys()),
                     format_func=lambda item: (
                         f'{master_by_id[item]["college_name"]} '
-                        f'— {master_by_id[item].get("control_type") or "Control type not listed"}'
+                        f'â€” {master_by_id[item].get("control_type") or "Control type not listed"}'
                     ),
                     key="college_master_match",
                 )
@@ -1003,7 +1006,7 @@ with tabs[4]:
                         st.error(f"Could not save academic term: {exc}")
 
         st.divider()
-        st.markdown(f"#### Existing configuration — {selected_config_college['name']}")
+        st.markdown(f"#### Existing configuration â€” {selected_config_college['name']}")
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Saved schedule portals**")
@@ -1143,3 +1146,4 @@ with tabs[5]:
         "This tab does not change course research, instructor research, evidence, "
         "research history or local college configuration."
     )
+
